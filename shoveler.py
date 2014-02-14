@@ -43,8 +43,11 @@ def reporter(msg, lvl='info'):
     :param lvl:
     """
 
-    log = getattr(LOG, lvl.lower())
-    log(msg)
+    try:
+        log = getattr(LOG, lvl.lower())
+        log(msg)
+    except Exception:
+        pass
 
 
 def head_request(url, headers, rpath):
@@ -72,7 +75,8 @@ def get_request(url, headers, rpath, stream=False):
         reporter(
             msg='INFO: %s %s %s' % (resp.status_code,
                                     resp.reason,
-                                    resp.request)
+                                    resp.request),
+            lvl='debug'
         )
     except Exception as exp:
         reporter('Not able to perform Request ERROR: %s' % exp, lvl='error')
@@ -84,7 +88,8 @@ def downloader(url, rpath, fheaders, local_f, mode):
     """Download an Object."""
 
     # Perform Object GET
-    for rty in retryloop(attempts=5, delay=1, obj=rpath):
+    object_ref = 'Downloading [ %s = %s ]' % (rpath, local_f)
+    for rty in retryloop(attempts=5, delay=1, obj=object_ref):
         resp = get_request(
             url=url,
             rpath=rpath,
@@ -92,19 +97,16 @@ def downloader(url, rpath, fheaders, local_f, mode):
             stream=True
         )
         if resp is not None and resp.status_code > 300:
-            reporter('Failed download on "%s". retrying' % rpath, lvl='error')
             rty()
         else:
             # Open our source file and write it
-            if os.path.exists(local_f):
-                os.rename(local_f, '%s.1' % local_f)
-
-            with open(local_f, mode) as f_name:
-                for chunk in resp.iter_content(chunk_size=2048):
-                    if chunk:
-                        f_name.write(chunk)
-                        f_name.flush()
-            resp.close()
+            if not os.path.exists(local_f):
+                with open(local_f, mode) as f_name:
+                    for chunk in resp.iter_content(chunk_size=2048):
+                        if chunk:
+                            f_name.write(chunk)
+                            f_name.flush()
+                resp.close()
 
 
 def mkdir_p(path):
@@ -176,7 +178,7 @@ def _obj_index(url, headers, b_path, m_path):
                 for obj in resp.json():
                     f_list.append(obj['name'])
 
-                last_obj_in_list = f_list[-1]
+                last_obj_in_list = f_list[-1].split('=')[0]
                 if l_obj is last_obj_in_list:
                     return f_list
                 else:
@@ -249,57 +251,45 @@ def _arg_parser():
     )
     download.set_defaults(method='download')
     download.add_argument(
-        '-d',
-        '--dir',
-        help='Set the full path where we will download the files.',
+        '-e',
+        '--export',
+        help='Name of the container. ACTION: container=local/path',
         metavar='',
-        default=os.environ.get('OS_DIR', None)
-    )
-    download.add_argument(
-        '-c',
-        '--container',
-        help='Name of the container.',
-        metavar='',
-        default=os.environ.get('OS_CONTAINER', None)
+        action='append',
+        default=[]
     )
 
     test = subpar.add_parser(
         'test',
         help='Index and test a download operation.'
     )
+
     test.add_argument(
-        '-d',
-        '--dir',
-        help='Set the full path where we will download the files.',
+        '-e',
+        '--export',
+        help='Name of the container. ACTION: container=local/path',
         metavar='',
-        default=os.environ.get('OS_DIR', None)
-    )
-    test.add_argument(
-        '-c',
-        '--container',
-        help='Name of the container.',
-        metavar='',
-        default=os.environ.get('OS_CONTAINER', None)
+        action='append',
+        default=[]
     )
     test.set_defaults(method='test')
 
     return parser
 
 
-def load_logging(cmd):
+def load_logging(cmd, container):
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s:%(levelname)s => %(message)s"
     )
 
     LOG.setLevel(logging.DEBUG)
-    fileHandler = logging.handlers.RotatingFileHandler(
-        filename=cmd['log_file'],
-        maxBytes=5120000,
-        backupCount=5
+    filehandler = logging.FileHandler(
+        filename='%s.%s' % (container, cmd['log_file']),
     )
-    fileHandler.setLevel(logging.DEBUG)
-    fileHandler.setFormatter(formatter)
-    LOG.addHandler(fileHandler)
+
+    filehandler.setLevel(logging.DEBUG)
+    filehandler.setFormatter(formatter)
+    LOG.addHandler(filehandler)
 
     streamhandler = logging.StreamHandler()
     if cmd['verbose'] is True:
@@ -554,8 +544,7 @@ def retryloop(attempts, timeout=None, delay=None, backoff=1, obj=None):
         reporter(msg, lvl='error')
 
 
-def main():
-
+def export_operation(cmd, container, directory):
     def recurse_files(dir_ref='ROOT', dir_name=None):
         """Recursivly index all files found in the container.
 
@@ -587,22 +576,11 @@ def main():
             else:
                 print('Ignored Reference [ %s ]' % my_file)
 
-    parser = _arg_parser()
-    if len(sys.argv) < 2:
-        raise SystemExit(parser.print_help())
+    compiled_files = {}
+    pointers = []
 
-    cmd = vars(parser.parse_args())
-
-    if cmd['debug'] is True:
-        cmd['verbose'] = True
-        httplib.HTTPConnection.debuglevel = 1
-
-    # Load logging
-    load_logging(cmd)
-
-    # Set all of the storage objects that we need
     fheaders = set_headers(token=cmd['token'])
-    path = 'v1/%s/%s' % (cmd['account_id'], cmd['container'])
+    path = 'v1/%s/%s' % (cmd['account_id'], container)
     url = urlparse.urlparse(REGIONS[cmd['region']])
     encoded_path = ustr(path)
 
@@ -610,11 +588,11 @@ def main():
     req = head_request(url=url, headers=fheaders, rpath=encoded_path)
 
     if any([req.status_code == 404, req.status_code == 401]):
-        raise SystemExit('container %s not found.' % cmd['container'])
+        print('container %s not found.' % container)
     else:
         with IndicatorThread(msg='Indexing Cloud Files'):
             base_path = marked_path = (
-                '%s/?limit=10000&format=json' % encoded_path
+                '%s?limit=10000&format=json' % encoded_path
             )
             file_list = _obj_index(
                 url=url,
@@ -622,8 +600,6 @@ def main():
                 b_path=base_path,
                 m_path=marked_path
             )
-            compiled_files = {}
-            pointers = []
 
         with IndicatorThread(msg='Building Download Index'):
             for my_file in file_list:
@@ -662,12 +638,12 @@ def main():
             'cf_job': downloader,
             'fheaders': fheaders,
             'path': encoded_path,
-            'dir': cmd['dir']
+            'dir': directory
         }
 
         if cmd['method'] is 'download':
             with IndicatorThread(msg='Building Local Directory Structure'):
-                for dirs in set_unique_dirs(file_names, cmd['dir']):
+                for dirs in set_unique_dirs(file_names, directory):
                     mkdir_p(dirs)
 
             job_processer(
@@ -698,21 +674,40 @@ def main():
                 % len(files_no_name)
             )
 
-            print('\nPost action Report:')
-            print(''.join(['=' for _ in range(len(msg_compiled_files))]))
-            for rep in [msg_compiled_files, msg_with_files, msg_without_files]:
-                print(rep)
+        print('\nPost action Report for %s:' % container)
+        print(''.join(['=' for _ in range(len(msg_compiled_files))]))
+        for rep in [msg_compiled_files, msg_with_files, msg_without_files]:
+            print(rep)
 
-            if len(files_no_name) > 0:
-                localreport = os.path.join(os.getcwd(), 'unknown_files.log')
-                with open(localreport, 'wb') as report:
-                    for line in files_no_name:
-                        try:
-                            report.write('%s\n' % list(line))
-                        except Exception as exp:
-                            print(exp, line)
-                print('A report for all unknown data objects'
-                      ' can be found here %s' % localreport)
+        if len(files_no_name) > 0:
+            localreport = os.path.join(os.getcwd(), 'unknown_files.log')
+            with open(localreport, 'wb') as report:
+                for line in files_no_name:
+                    try:
+                        report.write('%s\n' % list(line))
+                    except Exception as exp:
+                        print(exp, line)
+            print('A report for all unknown data objects'
+                  ' can be found here %s\n' % localreport)
+
+
+def main():
+    parser = _arg_parser()
+    if len(sys.argv) < 2:
+        raise SystemExit(parser.print_help())
+
+    cmd = vars(parser.parse_args())
+
+    if cmd['debug'] is True:
+        cmd['verbose'] = True
+        httplib.HTTPConnection.debuglevel = 1
+
+    # Load logging
+    for export in cmd['export']:
+        container, local_path = export.split('=')
+        load_logging(cmd, container)
+        # Set all of the storage objects that we need
+        export_operation(cmd=cmd, container=container, directory=local_path)
 
 
 if __name__ == "__main__":
