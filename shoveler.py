@@ -18,6 +18,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import signal
 import time
 import urlparse
 import urllib
@@ -115,16 +116,17 @@ def mkdir_p(path):
     try:
         if not os.path.isdir(path):
             os.makedirs(path)
-    except OSError as exc:
+    except OSError:
         pass
 
 
 def ustr(obj):
     """If an Object is unicode convert it.
 
-    :param object:
+    :param obj:
     :return:
     """
+
     if obj is not None and isinstance(obj, unicode):
         return str(obj.encode('utf8'))
     else:
@@ -313,12 +315,21 @@ def worker_proc(job_action, concurrency, queue, kwargs, daemon=True):
     :param job_action: What function will be used
     :param concurrency: The number of jobs that will be processed
     :param queue: The Queue
-    :param t_args: Optional
+    :param kwargs: Optional
+    :param daemon: Bol
 
     All threads produced by the worker are limited by the number of concurrency
     specified by the user. The Threads are all made active prior to them
     processing jobs.
     """
+
+    def stop(*args):
+        if jobs:
+            for job in jobs:
+                job.terminate()
+        if join_jobs:
+            for job in join_jobs:
+                job.terminate()
 
     arguments = []
     for item in [queue, kwargs]:
@@ -328,8 +339,10 @@ def worker_proc(job_action, concurrency, queue, kwargs, daemon=True):
     jobs = [multiprocessing.Process(target=job_action,
                                     args=tuple(arguments))
             for _ in xrange(concurrency)]
-
     join_jobs = []
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGHUP, stop)
     for _job in jobs:
         join_jobs.append(_job)
         _job.daemon = daemon
@@ -408,7 +421,7 @@ def job_processer(num_jobs, objects, job_action, concur, kwargs=None):
     :param objects:
     :param job_action:
     :param concur:
-    :param payload:
+    :param kwargs:
     """
 
     count = 0
@@ -423,10 +436,12 @@ def job_processer(num_jobs, objects, job_action, concur, kwargs=None):
         work_q = basic_queue(objects[work:work + batch_size])
 
         with IndicatorThread(work_q=work_q):
-            worker_proc(job_action=job_action,
-                        concurrency=concur,
-                        queue=work_q,
-                        kwargs=kwargs)
+            worker_proc(
+                job_action=job_action,
+                concurrency=concur,
+                queue=work_q,
+                kwargs=kwargs
+            )
         work_q.close()
 
 
@@ -463,7 +478,7 @@ def doerator(work_q, kwargs):
     """Do Jobs until done.
 
     :param work_q:
-    :param job:
+    :param kwargs:
     """
     job = kwargs.pop('cf_job')
     remote_path = kwargs.pop('path')
@@ -544,40 +559,92 @@ def retryloop(attempts, timeout=None, delay=None, backoff=1, obj=None):
         reporter(msg, lvl='error')
 
 
-def export_operation(cmd, container, directory):
-    def recurse_files(dir_ref='ROOT', dir_name=None):
-        """Recursivly index all files found in the container.
+def recurse_files(compiled_files, pointers, dir_ref='ROOT', dir_name=None):
+    """Recursivly index all files found in the container.
 
-        :param dir_ref:
-        :param dir_name:
-        """
-        for my_file in [f for f in pointers if f.startswith(dir_ref)]:
-            msf = my_file.split('/')
-            if len(msf) >= 4:
-                if msf[1] in compiled_files:
-                    cf = compiled_files[msf[1]]
-                    if dir_name is None:
-                        cf['name'] = msf[3]
-                    else:
-                        cf['name'] = os.path.join(dir_name, msf[3])
-                else:
-                    if msf[2] == 'dir':
-                        if dir_name is None:
-                            recurse_files(
-                                dir_ref=msf[1], dir_name=msf[3]
-                            )
-                        else:
-                            recurse_files(
-                                dir_ref=msf[1],
-                                dir_name=os.path.join(dir_name, msf[3])
-                            )
-                    else:
-                        recurse_files(dir_ref=msf[1])
+    :param dir_ref:
+    :param dir_name:
+    """
+
+    def queue_loader(_dir_ref, _dir_name):
+        for my_file in pointers:
+            if my_file.startswith(_dir_ref):
+                obj = {'my_file': my_file, '_dir_name': _dir_name}
+                queue.put(obj)
+
+    def threader():
+        def stop(*args):
+            if jobs:
+                for job in jobs:
+                    job.terminate()
+            if join_jobs:
+                for job in join_jobs:
+                    job.terminate()
+
+        jobs = [
+            multiprocessing.Process(target=worker, args=(queue,))
+            for _ in range(50)
+        ]
+        join_jobs = []
+
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGHUP, stop)
+        for job in jobs:
+            job.start()
+            join_jobs.append(job)
+
+        for job in join_jobs:
+            job.join()
+
+    def worker(my_queue):
+        while True:
+            action_args = get_from_q(my_queue)
+            if action_args is not None:
+                action_args['q'] = my_queue
+                processer(**action_args)
             else:
-                print('Ignored Reference [ %s ]' % my_file)
+                break
 
-    compiled_files = {}
-    pointers = []
+    def processer(q, my_file, _dir_name):
+        msf = my_file.split('/')
+        if len(msf) >= 4:
+            if msf[1] in compiled_files:
+                _cf = compiled_files[msf[1]]
+                if _dir_name is None:
+                    _cf['name'] = msf[3]
+                else:
+                    _cf['name'] = os.path.join(_dir_name, msf[3])
+                compiled_files[msf[1]] = _cf
+            else:
+                if msf[2] == 'dir':
+                    if _dir_name is None:
+                        queue_loader(
+                            _dir_ref=msf[1],
+                            _dir_name=msf[3],
+                        )
+                    else:
+                        queue_loader(
+                            _dir_ref=msf[1],
+                            _dir_name=os.path.join(_dir_name, msf[3]),
+                        )
+                else:
+                    queue_loader(
+                        _dir_ref=msf[1],
+                        _dir_name=_dir_name,
+                    )
+        else:
+            print('Ignored Reference [ %s ]' % my_file)
+
+    manager = multiprocessing.Manager()
+    queue = manager.Queue()
+    queue_loader(dir_ref, dir_name)
+    threader()
+
+
+def export_operation(cmd, container, directory):
+    manager = multiprocessing.Manager()
+    compiled_files = manager.dict()
+    pointers = manager.list()
 
     fheaders = set_headers(token=cmd['token'])
     path = 'v1/%s/%s' % (cmd['account_id'], container)
@@ -610,19 +677,25 @@ def export_operation(cmd, container, directory):
                         cf = compiled_files[split_file[1]] = {}
                     else:
                         cf = compiled_files[split_file[1]]
+
                     dp = cf['data_paths'] = {}
                     dp[split_file[2]] = my_file
+                    compiled_files[split_file[1]] = cf
                 else:
                     pointers.append(my_file)
 
             # Recurse through all of the pointers and locate the files.
-            recurse_files()
+            recurse_files(compiled_files, pointers)
+
+        compiled_files = dict(compiled_files)
+        del pointers
 
         if cmd['verbose'] is True:
             print(json.dumps(compiled_files, indent=2))
 
+        compiled_files_items = compiled_files.items()
         file_names = [
-            inode[1]['name'] for inode in compiled_files.items()
+            inode[1]['name'] for inode in compiled_files_items
             if 'name' in inode[1]
         ]
 
@@ -648,14 +721,14 @@ def export_operation(cmd, container, directory):
 
             job_processer(
                 num_jobs=number_of_jobs,
-                objects=compiled_files.items(),
+                objects=compiled_files_items,
                 job_action=doerator,
                 concur=concurency,
                 kwargs=download_args
             )
 
         with IndicatorThread(msg='Building Post Action Report'):
-            msg_compiled_files = (
+            msg__compiled_files = (
                 'Number of compiled Object Found in the Container: %s'
                 % number_of_jobs
             )
@@ -675,8 +748,8 @@ def export_operation(cmd, container, directory):
             )
 
         print('\nPost action Report for %s:' % container)
-        print(''.join(['=' for _ in range(len(msg_compiled_files))]))
-        for rep in [msg_compiled_files, msg_with_files, msg_without_files]:
+        print(''.join(['=' for _ in range(len(msg__compiled_files))]))
+        for rep in [msg__compiled_files, msg_with_files, msg_without_files]:
             print(rep)
 
         if len(files_no_name) > 0:
